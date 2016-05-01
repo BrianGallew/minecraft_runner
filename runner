@@ -1,0 +1,205 @@
+#! /usr/bin/env python
+"""
+Start up one (or more) Minecraft servers, with appropriate zeroconf.
+
+Based on the Python script template at
+https://github.com/BrianGallew/script_templates/blob/master/template.py
+"""
+
+import socket
+import time
+import threading
+import ConfigParser
+import platform
+import subprocess
+import os
+import tempfile
+import re
+import logging
+import logging.handlers
+logger = logging.getLogger(__name__)
+# Requires Python 2.7 or better
+import argparse
+option_group = argparse.Namespace()
+
+# Basic command to start up the minecraft server.  IPv4, headless, and
+# nogui are non-optional, though you can, of course, override it in the
+# config file.  Try not to be clever.
+DEFAULT_CMD = '''%(java)s -server %(options)s -Djava.net.preferIPv4Stack=true -Djava.awt.headless=true -Xms%(memory)s -Xmx%(memory)s -jar %(jarfile)s nogui'''
+
+# This is the set of options available in runner.conf
+PARSER_CONFIG = {'title': platform.uname()[1],
+                 'port': '25565',
+                 'memory': '3G',
+                 'options': '-XX:+UseG1GC -XX:+UseNUMA -XX:+AggressiveOpts -XX:+DisableExplicitGC -XX:+OptimizeStringConcat -XX:MaxGCPauseMillis=400 -XX:PermSize=256m',
+                 'java': '/usr/bin/java',
+                 'jarfile': 'server.jar',
+                 'directory': 'minecraft',
+                 'command': DEFAULT_CMD}
+
+
+class Flag(object):
+
+    'Simple flag used to kill off a thread'
+    end = False
+
+
+def broadcast_service(msg, flag):
+    'Minecraft LAN service announcement'
+    logger.info('Announcing %s', msg)
+
+    while 1:
+        if flag.end:
+            return
+        try:
+            time.sleep(1.5)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.sendto(msg, ("255.255.255.255", 4445))
+        except:
+            # This happens a lot when the service comes up before networking is
+            # stable.  Feh.
+            time.sleep(5)
+
+
+def load_minecraft_server_data(filename):
+    'Just load up the config file'
+    parser = ConfigParser.ConfigParser()
+    parser.read(filename)
+    logger.debug('Loaded config from %s', filename)
+    return parser
+
+
+def run_a_server(server, options):
+    'Run a Minecraft server'
+    logging.info('Starting %s with %s', server, str(options))
+
+    # This string will be used both as a tmux session name as well as what is
+    # needed for LAN broadcast.
+
+    msg = "[MOTD]%(title)s[/MOTD][AD]%(port)s[/AD]" % options
+    flag = Flag()
+    t = threading.Thread(target=broadcast_service, args=(msg, flag))
+    t.setDaemon(True)
+    t.start()
+
+    # This matters because TMUX doesn't like spaces in titles
+    options['title'] = options['title'].replace('.', '_')
+    command = options['command'] % options
+    logger.info('Launching %s', command)
+    result = subprocess.call([option_group.tmux, 'new-window', '-d',
+                              '-c', options['directory'],
+                              '-n', options['title'],
+                              command])
+    check_cmd = [option_group.tmux, 'list-windows']
+    window_name = re.compile(r' %s[-+*#]? ' % options['title'])
+    while True:
+        result = ''
+        try:
+            logger.debug('checking tmux')
+            result = subprocess.check_output(check_cmd, stderr=None)
+            logger.debug('checking tmux, got %s', result)
+            if not window_name.search(result):
+                flag.end = True
+                return
+        except Exception as the_exception:
+            logging.warn('result=%s, exception=%s', result, the_exception)
+        time.sleep(30)
+
+
+def setup_logging():
+    """Sets up logging in a syslog format by log level
+    :param option_group: options as returned by the OptionParser
+    """
+    stderr_log_format = "%(levelname) -8s %(asctime)s %(funcName)s line:%(lineno)d: %(message)s"
+    file_log_format = "%(asctime)s - %(levelname)s - %(message)s"
+    if option_group.debug:
+        logger.setLevel(level=logging.DEBUG)
+    elif option_group.verbose:
+        logger.setLevel(level=logging.INFO)
+    else:
+        logger.setLevel(level=logging.WARNING)
+
+    handlers = []
+    if option_group.syslog:
+        handlers.append(
+            logging.handlers.SysLogHandler(facility=option_group.syslog))
+        # Use standard format here because timestamp and level will be added by
+        # syslogd.
+    if option_group.logfile:
+        handlers.append(logging.FileHandler(option_group.logfile))
+        handlers[0].setFormatter(logging.Formatter(file_log_format))
+    if not handlers:
+        handlers.append(logging.StreamHandler())
+        handlers[0].setFormatter(logging.Formatter(stderr_log_format))
+    for handler in logging.root.handlers:
+        logging.root.removeHandler(handler)
+    for handler in handlers:
+        logger.addHandler(handler)
+    return
+
+
+def main():
+    """Primary entry point."""
+    parser = argparse.ArgumentParser()
+    # Standard logging options.
+    parser.add_argument("-v", "--verbose", action='store_true',
+                        default=False, help="Verbose output")
+    parser.add_argument("-d", "--debug", action='store_true',
+                        default=False, help="Debugging output")
+    parser.add_argument("--syslog", metavar="FACILITY",
+                        help="Send log messages to the syslog")
+    parser.add_argument("--logfile", metavar="FILENAME",
+                        help="Send log messages to a file")
+    # script-specific options here
+    parser.add_argument("-t", "--tmux",
+                        default="/usr/local/bin/tmux",
+                        help="Path to tmux binary")
+    parser.add_argument("-T", "--tmpdir",
+                        help="TMPDIR [default: random]")
+    parser.add_argument("-s", "--session", default="minecraft",
+                        help="tmux session to use")
+    parser.add_argument("-c", "--configfile", metavar="FILENAME",
+                        default="runner.conf",
+                        help="Send log messages to a file")
+    parser.add_argument(dest="sections", nargs="*", default=["minecraft", ],
+                        help="Servers to be started: [default: %(default)s]")
+    parser.parse_args(namespace=option_group)
+    setup_logging()
+
+    # Your code here.
+    try:
+        config = load_minecraft_server_data(option_group.configfile)
+    except:
+        logger.critical(
+            'Unable to open configuration file %s', option_group.configfile)
+        exit(1)
+    # Temp dir to use.  Always set explicitly to /tmp because otherwise
+    # you'll never be able to re-join tmux on OSX.  Sorry.
+    if not option_group.tmpdir:
+        option_group.tmpdir = tempfile.mkdtemp()
+    logger.warn(
+        'Setting TMPDIR=%s, you will need that if you want to join the session',
+        option_group.tmpdir)
+
+    os.environ['TMPDIR'] = option_group.tmpdir
+    subprocess.call([option_group.tmux, 'new-session', '-d', '-s',
+                     option_group.session])
+    all_threads = []
+    for server in option_group.sections:
+        logger.debug('processing %s', server)
+        options = {}
+        options.update(PARSER_CONFIG)
+        options.update(dict(config.items(server)))
+
+        t = threading.Thread(target=run_a_server, args=(server, options))
+        t.start()
+        all_threads.append(t)
+    for t in all_threads:
+        t.join()
+
+    return
+
+
+if __name__ == '__main__':
+    main()
